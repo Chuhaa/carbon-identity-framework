@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2013, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
  *
@@ -24,6 +25,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.CarbonConstants;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
+import org.wso2.carbon.database.utils.jdbc.exceptions.DataAccessException;
 import org.wso2.carbon.identity.application.authentication.framework.AuthenticationDataPublisher;
 import org.wso2.carbon.identity.application.authentication.framework.cache.AuthenticationResultCacheEntry;
 import org.wso2.carbon.identity.application.authentication.framework.config.model.ApplicationConfig;
@@ -34,32 +36,28 @@ import org.wso2.carbon.identity.application.authentication.framework.context.Aut
 import org.wso2.carbon.identity.application.authentication.framework.context.AuthenticationContext;
 import org.wso2.carbon.identity.application.authentication.framework.context.SessionContext;
 import org.wso2.carbon.identity.application.authentication.framework.exception.FrameworkException;
+import org.wso2.carbon.identity.application.authentication.framework.exception.UserSessionException;
 import org.wso2.carbon.identity.application.authentication.framework.handler.request.AuthenticationRequestHandler;
 import org.wso2.carbon.identity.application.authentication.framework.internal.FrameworkServiceDataHolder;
-import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
-import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticationContextProperty;
-import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticationResult;
-import org.wso2.carbon.identity.application.authentication.framework.model.CommonAuthResponseWrapper;
+import org.wso2.carbon.identity.application.authentication.framework.model.*;
 import org.wso2.carbon.identity.application.authentication.framework.services.PostAuthenticationMgtService;
+import org.wso2.carbon.identity.application.authentication.framework.store.UserSessionStore;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkConstants;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
 import org.wso2.carbon.identity.application.authentication.framework.util.LoginContextManagementUtil;
+import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.idp.mgt.util.IdPManagementUtil;
 import org.wso2.carbon.registry.core.utils.UUIDGenerator;
 import org.wso2.carbon.utils.multitenancy.MultitenantConstants;
 
-import java.io.IOException;
-import java.net.URLEncoder;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.util.*;
+
 
 public class DefaultAuthenticationRequestHandler implements AuthenticationRequestHandler {
 
@@ -160,7 +158,7 @@ public class DefaultAuthenticationRequestHandler implements AuthenticationReques
             if (postAuthenticationMgtService != null) {
                 postAuthenticationMgtService.handlePostAuthentication(request, response, context);
             } else {
-                if(log.isDebugEnabled()) {
+                if (log.isDebugEnabled()) {
                     log.debug("No post authentication service found. Hence not evaluating post authentication.");
                 }
                 LoginContextManagementUtil.markPostAuthenticationCompleted(context);
@@ -372,6 +370,17 @@ public class DefaultAuthenticationRequestHandler implements AuthenticationReques
                             authenticationContextProperties);
                 }
 
+
+                if (isUserSessionMappingEnabled()) {
+                    try {
+                        UserSessionStore.getInstance().updateLastAccessTime(sessionContextKey,
+                                Long.toString(updatedSessionTime));
+                    } catch (UserSessionException e) {
+                        log.error("Error while updating last access time to the database", e);
+                    }
+                }
+
+
                 // TODO add to cache?
                 // store again. when replicate  cache is used. this may be needed.
                 FrameworkUtils.addSessionContextToCache(sessionContextKey, sessionContext, applicationTenantDomain);
@@ -411,6 +420,14 @@ public class DefaultAuthenticationRequestHandler implements AuthenticationReques
                 setAuthCookie(request, response, context, sessionKey, applicationTenantDomain);
                 FrameworkUtils.publishSessionEvent(sessionContextKey, request, context, sessionContext, sequenceConfig
                         .getAuthenticatedUser(), FrameworkConstants.AnalyticsAttributes.SESSION_CREATE);
+
+                if (isUserSessionMappingEnabled()) {
+                    try {
+                        storeSessionMetaData(sessionContextKey, request);
+                    } catch (UserSessionException e) {
+                        log.error("Error while storing session meta data to the database", e);
+                    }
+                }
             }
 
             if (authenticatedUserTenantDomain == null) {
@@ -418,6 +435,13 @@ public class DefaultAuthenticationRequestHandler implements AuthenticationReques
             }
             publishAuthenticationSuccess(request, context, sequenceConfig.getAuthenticatedUser());
 
+            if (isUserSessionMappingEnabled()) {
+                try {
+                    storeSessionData(context, sessionContextKey);
+                } catch (UserSessionException e) {
+                    log.error("Error while storing session details of the authenticated user to the database", e);
+                }
+            }
         }
 
         // Checking weather inbound protocol is an already cache removed one, request come from federated or other
@@ -466,11 +490,92 @@ public class DefaultAuthenticationRequestHandler implements AuthenticationReques
     }
 
     /**
-     * Add authentication request as request attribute
+     * Method used to store user and session related data to the database.
      *
-     * @param request
-     * @param authenticationResult
+     * @param context           {@link AuthenticationContext} object with the authentication request related data
+     * @param sessionContextKey of the authenticated session
      */
+    private void storeSessionData(AuthenticationContext context, String sessionContextKey)
+            throws UserSessionException {
+
+        String subject = context.getSequenceConfig().getAuthenticatedUser().
+                getAuthenticatedSubjectIdentifier();
+        String appName = context.getServiceProviderName();
+        String appTenant = context.getTenantDomain();
+        int appTenantId = (appTenant == null) ? -1 : IdentityTenantUtil.getTenantId(appTenant);
+        String inboundAuth = context.getCallerPath().substring(1);
+        int appID = UserSessionStore.getInstance().getAppId(appName, appTenantId);
+
+        for (AuthenticatedIdPData authenticatedIdPData : context.getCurrentAuthenticatedIdPs().values()) {
+            String userName = authenticatedIdPData.getUser().getUserName();
+            String tenantDomain = getAuthenticatedUserTenantDomain(context, null);
+            Integer tenantId = (tenantDomain == null) ? -1 : IdentityTenantUtil.getTenantId(tenantDomain);
+            String userStoreDomain = authenticatedIdPData.getUser().getUserStoreDomain();
+            String idpName = authenticatedIdPData.getIdpName();
+            String userID;
+            try {
+                int idpId = UserSessionStore.getInstance().getIdPId(idpName);
+                synchronized (this) {
+                    userID = UserSessionStore.getInstance().getUserID(userName, tenantId, userStoreDomain, idpId);
+                    if (userID == null) {
+                        userID = UUIDGenerator.generateUUID();
+                        UserSessionStore.getInstance().storeUserData(userID, userName, tenantId, userStoreDomain,
+                                idpId);
+                    }
+                }
+                if (!UserSessionStore.getInstance().isExistingMapping(userID, sessionContextKey)) {
+                    UserSessionStore.getInstance().storeUserSessionData(userID, sessionContextKey);
+                }
+            } catch (UserSessionException e) {
+                throw new UserSessionException("Error while storing the session data to the database.", e);
+            }
+        }
+
+        try {
+            if (appID != -1 && !UserSessionStore.getInstance().isExistingAppSession(sessionContextKey, subject,
+                    appID, appTenantId, inboundAuth)) {
+                UserSessionStore.getInstance().storeAppSessionData(sessionContextKey, subject,
+                        appID, appTenantId, inboundAuth);
+            }
+        } catch (DataAccessException e) {
+            throw new UserSessionException("Error while storing the App session data to the database.", e);
+        }
+    }
+
+    /**
+     * Method to store session meta data.
+     *
+     * @param sessionId Id of the authenticated session
+     * @param request   HttpServletRequest
+     * @throws UserSessionException while storing session meta data
+     */
+    private void storeSessionMetaData(String sessionId, HttpServletRequest request) throws UserSessionException {
+        String userAgent = request.getHeader(javax.ws.rs.core.HttpHeaders.USER_AGENT);
+        String ip = request.getRemoteAddr();
+        String time = Long.toString(System.currentTimeMillis());
+
+        try {
+            UserSessionStore.getInstance().storeSessionMetaData(sessionId, "User Agent", userAgent);
+            UserSessionStore.getInstance().storeSessionMetaData(sessionId, "IP", ip);
+            UserSessionStore.getInstance().storeSessionMetaData(sessionId, "Login Time", time);
+            UserSessionStore.getInstance().storeSessionMetaData(sessionId, "Last Access Time", time);
+        } catch (UserSessionException e) {
+            throw new UserSessionException("Error while storing session meta data.", e);
+        }
+    }
+
+    /**
+     * Method to check whether the SessionUserManager configuration is enabled.
+     *
+     * @return the boolean value of the enable decision
+     */
+    private boolean isUserSessionMappingEnabled() {
+
+        String sessionUserManagerConfig = IdentityUtil
+                .getProperty("JDBCPersistenceManager.SessionDataPersist.UserSessionMapping.Enable");
+        return Boolean.valueOf(sessionUserManagerConfig);
+    }
+
     private void addAuthenticationResultToRequest(HttpServletRequest request,
                                                   AuthenticationResult authenticationResult) {
 
